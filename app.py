@@ -10,70 +10,67 @@ app.secret_key = os.urandom(24)
 def disaggregate_dataframe(df: pd.DataFrame, date_column: str, value_column: str) -> pd.DataFrame:
     """
     Takes a DataFrame and disaggregates rows where the fiscal week spans two months.
-    This version is corrected to robustly preserve all other columns and their order.
     """
     # --- 1. Validate and Prepare Data ---
     required_cols = {date_column, value_column}
     if not required_cols.issubset(df.columns):
         raise ValueError(f"Input file is missing one or more required columns. Expected: {', '.join(required_cols)}")
 
-    # Store original column order to use for the final output
     original_column_order = list(df.columns)
     df[date_column] = pd.to_datetime(df[date_column])
     
-    # --- 2. Process Data ---
+    # --- 2. Process Data Row-by-Row to Preserve Order ---
     output_rows = []
     
     for _, row in df.iterrows():
+        # Using to_dict() on each row ensures all original columns are preserved.
         original_row_data = row.to_dict()
         start_date = original_row_data[date_column]
         value = original_row_data[value_column]
-        end_date = start_date + pd.Timedelta(days=6)
+        end_of_week = start_date + pd.Timedelta(days=6)
         
-        if start_date.month == end_date.month:
+        # Use robust period comparison to check if the week needs to be split
+        is_split = start_date.to_period('M') != end_of_week.to_period('M')
+        
+        if not is_split:
+            # If not split, append the original row data directly.
             output_rows.append(original_row_data)
         else:
-            days_in_first_month = (start_date.days_in_month - start_date.day) + 1
-            days_in_second_month = 7 - days_in_first_month
-            value_first_part = (value / 7) * days_in_first_month
-            value_second_part = (value / 7) * days_in_second_month
+            # If split, perform the robust calculation and append the two new rows.
+            end_of_month = start_date + pd.offsets.MonthEnd(0)
+            end_of_first_part = min(end_of_week, end_of_month)
             
-            # First Partial Week Row (preserves all original data)
+            days_in_first_part = (end_of_first_part - start_date).days + 1
+            days_in_second_part = 7 - days_in_first_part
+            
+            # This is the proportional split logic based on number of days
+            value_first_part = (value / 7) * days_in_first_part if days_in_first_part > 0 else 0
+            value_second_part = value - round(value_first_part, 2) # More robust sum
+            
+            # First Partial Week Row
             new_row_1 = original_row_data.copy()
             new_row_1[value_column] = round(value_first_part, 2)
             output_rows.append(new_row_1)
             
-            # Second Partial Week Row (preserves all original data)
-            new_row_2 = original_row_data.copy()
-            new_row_2[value_column] = round(value_second_part, 2)
-            new_row_2[date_column] = end_date.replace(day=1)
-            output_rows.append(new_row_2)
+            # Second Partial Week Row (if it exists)
+            if days_in_second_part > 0:
+                new_row_2 = original_row_data.copy()
+                new_row_2[value_column] = round(value_second_part, 2)
+                # The second part always starts on day 1 of the next month
+                new_row_2[date_column] = end_of_week.replace(day=1, month=end_of_week.month, year=end_of_week.year)
+                output_rows.append(new_row_2)
 
-    if not output_rows:
-        return pd.DataFrame()
-
+    # --- 3. Create Final DataFrame and Format ---
     result_df = pd.DataFrame(output_rows)
     
-    # --- 3. Final Formatting and Column Ordering ---
-    # The dataframe is now built with all data, but the date column still has its original name.
-    
-    # First, format the date column before renaming it.
+    # Ensure the date column is of datetime type before formatting
+    result_df[date_column] = pd.to_datetime(result_df[date_column])
     result_df[date_column] = result_df[date_column].dt.strftime('%d-%b-%Y')
     
-    # Now, create the list of final column names in the correct order.
-    # We replace the original date column's name with 'Partial Week'.
-    final_column_order = []
-    for col_name in original_column_order:
-        if col_name == date_column:
-            final_column_order.append('Partial Week')
-        else:
-            final_column_order.append(col_name)
-
-    # Rename the date column in the dataframe itself
+    final_column_order = [ 'Partial Week' if col == date_column else col for col in original_column_order ]
     result_df.rename(columns={date_column: 'Partial Week'}, inplace=True)
     
-    # Reorder the dataframe columns to match the desired final order.
-    # This is the key step to ensure the output looks exactly like the input, but with the modified data.
+    # Reorder columns to match the original input file's structure
     result_df = result_df[final_column_order]
 
     return result_df
